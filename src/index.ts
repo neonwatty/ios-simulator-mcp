@@ -21,6 +21,124 @@ const TMP_ROOT_DIR = fs.mkdtempSync(
   path.join(os.tmpdir(), "ios-simulator-mcp-")
 );
 
+// ============ SESSION-BOUND SIMULATOR OWNERSHIP ============
+// This section implements exclusive simulator ownership per MCP session
+// to prevent multiple Claude Code instances from interfering with each other.
+
+const SESSION_ID = `mcp-${process.pid}-${Date.now()}`;
+const LOCK_DIR = path.join(os.homedir(), ".ios-simulator-mcp", "locks");
+
+// Session state - the simulator claimed by this session
+let claimedSimulatorUdid: string | null = null;
+
+interface LockInfo {
+  sessionId: string;
+  pid: number;
+  timestamp: number;
+}
+
+function ensureLockDir(): void {
+  if (!fs.existsSync(LOCK_DIR)) {
+    fs.mkdirSync(LOCK_DIR, { recursive: true });
+  }
+}
+
+function getLockPath(udid: string): string {
+  return path.join(LOCK_DIR, `${udid}.lock`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readLockFile(lockPath: string): LockInfo | null {
+  try {
+    const content = fs.readFileSync(lockPath, "utf-8");
+    return JSON.parse(content) as LockInfo;
+  } catch {
+    return null;
+  }
+}
+
+function isLockStale(lockPath: string): boolean {
+  const lockInfo = readLockFile(lockPath);
+  if (!lockInfo) return true;
+
+  // Check if the owning process is still alive
+  if (!isProcessAlive(lockInfo.pid)) {
+    return true;
+  }
+
+  // Check if lock is older than 24 hours (failsafe for edge cases)
+  const ageMs = Date.now() - lockInfo.timestamp;
+  if (ageMs > 24 * 60 * 60 * 1000) {
+    return true;
+  }
+
+  return false;
+}
+
+function tryAcquireLock(udid: string): boolean {
+  ensureLockDir();
+  const lockPath = getLockPath(udid);
+
+  // Check for existing lock
+  if (fs.existsSync(lockPath)) {
+    // Check if we already own this lock
+    const existingLock = readLockFile(lockPath);
+    if (existingLock && existingLock.sessionId === SESSION_ID) {
+      return true; // We already own it
+    }
+
+    // Check if lock is stale
+    if (isLockStale(lockPath)) {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        return false;
+      }
+    } else {
+      // Lock is held by another active session
+      return false;
+    }
+  }
+
+  // Try to create lock file exclusively
+  try {
+    const lockInfo: LockInfo = {
+      sessionId: SESSION_ID,
+      pid: process.pid,
+      timestamp: Date.now(),
+    };
+    fs.writeFileSync(lockPath, JSON.stringify(lockInfo, null, 2), {
+      flag: "wx",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseLock(udid: string): void {
+  const lockPath = getLockPath(udid);
+  try {
+    const lockInfo = readLockFile(lockPath);
+    // Only release if we own it
+    if (lockInfo && lockInfo.sessionId === SESSION_ID) {
+      fs.unlinkSync(lockPath);
+    }
+  } catch {
+    // Ignore errors during cleanup
+  }
+}
+
+// ============ END SESSION-BOUND SIMULATOR OWNERSHIP ============
+
 /**
  * Runs a command with arguments and returns the stdout and stderr
  * @param cmd - The command to run
@@ -138,19 +256,173 @@ async function getBootedDevice() {
   throw Error("No booted simulator found");
 }
 
+/**
+ * Gets all currently booted simulators
+ */
+async function getAllBootedSimulators(): Promise<
+  Array<{ name: string; id: string }>
+> {
+  const { stdout } = await run("xcrun", ["simctl", "list", "devices"]);
+  const simulators: Array<{ name: string; id: string }> = [];
+
+  const lines = stdout.split("\n");
+  for (const line of lines) {
+    if (line.includes("Booted")) {
+      const match = line.match(/\(([-0-9A-F]+)\)/);
+      if (match) {
+        const deviceId = match[1];
+        const deviceName = line.split("(")[0].trim();
+        simulators.push({ name: deviceName, id: deviceId });
+      }
+    }
+  }
+
+  return simulators;
+}
+
+/**
+ * Gets all available simulators (booted or shutdown)
+ */
+async function getAllAvailableSimulators(): Promise<
+  Array<{ name: string; id: string; state: string; runtime: string }>
+> {
+  const { stdout } = await run("xcrun", ["simctl", "list", "devices", "--json"]);
+  const data = JSON.parse(stdout);
+  const simulators: Array<{
+    name: string;
+    id: string;
+    state: string;
+    runtime: string;
+  }> = [];
+
+  for (const [runtime, devices] of Object.entries(data.devices)) {
+    for (const device of devices as any[]) {
+      if (device.isAvailable) {
+        simulators.push({
+          name: device.name,
+          id: device.udid,
+          state: device.state,
+          runtime: runtime.replace("com.apple.CoreSimulator.SimRuntime.", ""),
+        });
+      }
+    }
+  }
+
+  return simulators;
+}
+
+/**
+ * Claims a simulator for exclusive use by this session.
+ * If no UDID is provided, tries to claim an existing booted simulator,
+ * or boots a new one if all booted simulators are claimed.
+ */
+async function claimSimulator(
+  udid?: string
+): Promise<{ id: string; name: string }> {
+  // If we already have a claimed simulator that's still valid, return it
+  if (claimedSimulatorUdid) {
+    const booted = await getAllBootedSimulators();
+    const found = booted.find((s) => s.id === claimedSimulatorUdid);
+    if (found) {
+      return found;
+    }
+    // Our claimed simulator is no longer booted, release and reclaim
+    releaseLock(claimedSimulatorUdid);
+    claimedSimulatorUdid = null;
+  }
+
+  // If specific UDID requested, try to claim it
+  if (udid) {
+    if (tryAcquireLock(udid)) {
+      claimedSimulatorUdid = udid;
+      // Check if it's booted
+      const booted = await getAllBootedSimulators();
+      const found = booted.find((s) => s.id === udid);
+      if (found) {
+        return found;
+      }
+      // Not booted, boot it
+      await run("xcrun", ["simctl", "boot", udid]);
+      await run("open", ["-a", "Simulator.app"]);
+      // Wait for boot
+      await new Promise((r) => setTimeout(r, 3000));
+      const afterBoot = await getAllBootedSimulators();
+      const booted2 = afterBoot.find((s) => s.id === udid);
+      if (booted2) return booted2;
+      return { id: udid, name: "Simulator" };
+    }
+    throw new Error(
+      `Simulator ${udid} is already claimed by another Claude Code instance`
+    );
+  }
+
+  // Try to claim an existing booted simulator
+  const bootedSimulators = await getAllBootedSimulators();
+  for (const sim of bootedSimulators) {
+    if (tryAcquireLock(sim.id)) {
+      claimedSimulatorUdid = sim.id;
+      return sim;
+    }
+  }
+
+  // No unclaimed booted simulators - boot a new one
+  const available = await getAllAvailableSimulators();
+  const shutdownSims = available.filter((s) => s.state === "Shutdown");
+
+  if (shutdownSims.length === 0) {
+    throw new Error(
+      "No available simulators to boot. Please create one in Xcode."
+    );
+  }
+
+  // Prefer iPhone simulators
+  const iPhones = shutdownSims.filter((s) => s.name.includes("iPhone"));
+  const tooBoot = iPhones.length > 0 ? iPhones[0] : shutdownSims[0];
+
+  if (!tryAcquireLock(tooBoot.id)) {
+    throw new Error("Failed to acquire lock for simulator");
+  }
+
+  await run("xcrun", ["simctl", "boot", tooBoot.id]);
+  await run("open", ["-a", "Simulator.app"]);
+
+  claimedSimulatorUdid = tooBoot.id;
+
+  // Wait for boot
+  await new Promise((r) => setTimeout(r, 3000));
+
+  return { id: tooBoot.id, name: tooBoot.name };
+}
+
+/**
+ * Gets the device ID to use, with session claiming support.
+ * - If deviceId is provided, uses it directly
+ * - If we have a claimed simulator, uses that
+ * - Otherwise, auto-claims a simulator
+ */
+async function getBootedDeviceIdWithClaim(
+  deviceId: string | undefined
+): Promise<string> {
+  // If explicit deviceId provided, use it (allows override)
+  if (deviceId) {
+    return deviceId;
+  }
+
+  // If we have a claimed simulator, use it
+  if (claimedSimulatorUdid) {
+    return claimedSimulatorUdid;
+  }
+
+  // Auto-claim a simulator on first use
+  const claimed = await claimSimulator();
+  return claimed.id;
+}
+
+// Legacy function for backward compatibility (now calls the new one)
 async function getBootedDeviceId(
   deviceId: string | undefined
 ): Promise<string> {
-  // If deviceId not provided, get the currently booted simulator
-  let actualDeviceId = deviceId;
-  if (!actualDeviceId) {
-    const { id } = await getBootedDevice();
-    actualDeviceId = id;
-  }
-  if (!actualDeviceId) {
-    throw new Error("No booted simulator found and no deviceId provided");
-  }
-  return actualDeviceId;
+  return getBootedDeviceIdWithClaim(deviceId);
 }
 
 // Register tools only if they're not filtered
@@ -187,6 +459,217 @@ if (!isToolFiltered("get_booted_sim_id")) {
     }
   );
 }
+
+// ============ NEW TOOLS FOR SESSION-BOUND OWNERSHIP ============
+
+if (!isToolFiltered("claim_simulator")) {
+  server.tool(
+    "claim_simulator",
+    "Claim a simulator for exclusive use by this Claude Code session. Other instances won't be able to control this simulator until released.",
+    {
+      udid: z
+        .string()
+        .regex(UDID_REGEX)
+        .optional()
+        .describe(
+          "UDID of specific simulator to claim. If not provided, claims any available simulator (preferring already-booted ones)."
+        ),
+    },
+    async ({ udid }) => {
+      try {
+        const claimed = await claimSimulator(udid);
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: `Successfully claimed simulator: "${claimed.name}" (${claimed.id})\n\nThis simulator is now exclusively controlled by this Claude Code session.`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error claiming simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+if (!isToolFiltered("get_claimed_simulator")) {
+  server.tool(
+    "get_claimed_simulator",
+    "Get information about the simulator claimed by this Claude Code session",
+    {},
+    async () => {
+      try {
+        if (!claimedSimulatorUdid) {
+          return {
+            isError: false,
+            content: [
+              {
+                type: "text",
+                text: "No simulator currently claimed. Use claim_simulator or any UI tool to auto-claim one.",
+              },
+            ],
+          };
+        }
+
+        const booted = await getAllBootedSimulators();
+        const sim = booted.find((s) => s.id === claimedSimulatorUdid);
+
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: sim
+                ? `Claimed simulator: "${sim.name}" (${sim.id}) - Booted`
+                : `Claimed simulator: ${claimedSimulatorUdid} - Not currently booted`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error getting claimed simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+if (!isToolFiltered("list_simulators")) {
+  server.tool(
+    "list_simulators",
+    "List all available iOS simulators with their status and claim information",
+    {},
+    async () => {
+      try {
+        const all = await getAllAvailableSimulators();
+        ensureLockDir();
+
+        const lines = all.map((sim) => {
+          const lockPath = getLockPath(sim.id);
+          let claimStatus = "Available";
+
+          if (fs.existsSync(lockPath)) {
+            const lockInfo = readLockFile(lockPath);
+            if (lockInfo) {
+              if (lockInfo.sessionId === SESSION_ID) {
+                claimStatus = "Claimed by YOU";
+              } else if (isProcessAlive(lockInfo.pid)) {
+                claimStatus = "Claimed by another session";
+              } else {
+                claimStatus = "Available (stale lock)";
+              }
+            }
+          }
+
+          return `${sim.name} (${sim.id.slice(0, 8)}...)\n  State: ${sim.state}\n  Runtime: ${sim.runtime}\n  Status: ${claimStatus}`;
+        });
+
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: lines.join("\n\n"),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error listing simulators: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+if (!isToolFiltered("boot_simulator")) {
+  server.tool(
+    "boot_simulator",
+    "Boot a specific simulator and claim it for this session",
+    {
+      udid: z
+        .string()
+        .regex(UDID_REGEX)
+        .describe("UDID of the simulator to boot"),
+    },
+    async ({ udid }) => {
+      try {
+        // First try to claim it
+        if (!tryAcquireLock(udid)) {
+          throw new Error(
+            "Simulator is already claimed by another Claude Code instance"
+          );
+        }
+
+        claimedSimulatorUdid = udid;
+
+        // Boot the simulator
+        await run("xcrun", ["simctl", "boot", udid]);
+        await run("open", ["-a", "Simulator.app"]);
+
+        // Wait for boot
+        await new Promise((r) => setTimeout(r, 3000));
+
+        const booted = await getAllBootedSimulators();
+        const sim = booted.find((s) => s.id === udid);
+
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: sim
+                ? `Booted and claimed simulator: "${sim.name}" (${sim.id})`
+                : `Booted and claimed simulator: ${udid}`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error booting simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+// ============ END NEW TOOLS ============
 
 if (!isToolFiltered("open_simulator")) {
   server.tool(
@@ -768,11 +1251,14 @@ if (!isToolFiltered("record_video")) {
         const defaultFileName = `simulator_recording_${Date.now()}.mp4`;
         const outputFile = ensureAbsolutePath(output_path ?? defaultFileName);
 
-        // Start the recording process
+        // Get the actual device ID (using claimed simulator if available)
+        const actualUdid = await getBootedDeviceIdWithClaim(undefined);
+
+        // Start the recording process with the specific UDID (not "booted")
         const recordingProcess = spawn("xcrun", [
           "simctl",
           "io",
-          "booted",
+          actualUdid, // FIX: Use specific UDID instead of "booted"
           "recordVideo",
           ...(codec ? [`--codec=${codec}`] : []),
           ...(display ? [`--display=${display}`] : []),
@@ -1006,8 +1492,32 @@ async function runServer() {
 
 runServer().catch(console.error);
 
+// Cleanup handlers for releasing simulator locks
+process.on("exit", () => {
+  if (claimedSimulatorUdid) {
+    releaseLock(claimedSimulatorUdid);
+  }
+});
+
+process.on("SIGINT", () => {
+  if (claimedSimulatorUdid) {
+    releaseLock(claimedSimulatorUdid);
+  }
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  if (claimedSimulatorUdid) {
+    releaseLock(claimedSimulatorUdid);
+  }
+  process.exit(0);
+});
+
 process.stdin.on("close", () => {
   console.log("iOS Simulator MCP Server closed");
+  if (claimedSimulatorUdid) {
+    releaseLock(claimedSimulatorUdid);
+  }
   server.close();
   try {
     fs.rmSync(TMP_ROOT_DIR, { recursive: true, force: true });
