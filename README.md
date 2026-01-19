@@ -1,8 +1,99 @@
-# iOS Simulator MCP Server
+# iOS Simulator MCP Server (Fork)
 
-[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=ios-simulator&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImlvcy1zaW11bGF0b3ItbWNwIl19) [![NPM Version](https://img.shields.io/npm/v/ios-simulator-mcp)](https://www.npmjs.com/package/ios-simulator-mcp)
+> **This is a fork of [joshuayoes/ios-simulator-mcp](https://github.com/joshuayoes/ios-simulator-mcp)** with additional features for multi-instance Claude Code support.
+
+[![NPM Version](https://img.shields.io/npm/v/ios-simulator-mcp)](https://www.npmjs.com/package/ios-simulator-mcp)
 
 A Model Context Protocol (MCP) server for interacting with iOS simulators. This server allows you to interact with iOS simulators by getting information about them, controlling UI interactions, and inspecting UI elements.
+
+## Fork Features
+
+This fork adds the following enhancements:
+
+### 1. Session-Bound Simulator Ownership
+Prevents multiple Claude Code instances from interfering with each other by implementing exclusive simulator locks:
+- Each MCP session gets a unique session ID
+- File-based locks at `~/.ios-simulator-mcp/locks/` prevent conflicts
+- Stale lock detection (process alive check + 24h failsafe)
+- Automatic cleanup on process exit (SIGINT, SIGTERM, stdin close)
+
+### 2. Screenshot Resolution Control
+The `ui_view` tool now returns properly-sized screenshots:
+- Detects screen dimensions in points from `ui_describe_all`
+- Resizes screenshots to match point dimensions (not retina pixels)
+- Compresses to JPEG at 80% quality for smaller payloads
+
+### New Tools
+
+| Tool | Description |
+|------|-------------|
+| `claim_simulator` | Claim a simulator for exclusive use by this Claude Code session |
+| `get_claimed_simulator` | Get information about the currently claimed simulator |
+| `list_simulators` | List all simulators with their claim status |
+| `boot_simulator` | Boot and claim a specific simulator in one step |
+
+## Fork Installation
+
+### Option 1: Install from GitHub (Recommended)
+
+```bash
+# Clone the fork
+git clone https://github.com/neonwatty/ios-simulator-mcp.git
+cd ios-simulator-mcp
+git checkout feat/session-bound-simulator-ownership
+
+# Install and build
+npm install
+npm run build
+```
+
+Then configure your MCP client to use the local build (see configuration below).
+
+### Option 2: Install via npm from GitHub
+
+```bash
+npm install -g github:neonwatty/ios-simulator-mcp#feat/session-bound-simulator-ownership
+```
+
+### Claude Code Configuration
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "ios-simulator": {
+      "command": "node",
+      "args": ["/path/to/ios-simulator-mcp/build/index.js"]
+    }
+  }
+}
+```
+
+Or use the CLI:
+
+```bash
+claude mcp add ios-simulator --command node --args "/path/to/ios-simulator-mcp/build/index.js"
+```
+
+### Cursor Configuration
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ios-simulator": {
+      "command": "node",
+      "args": ["/path/to/ios-simulator-mcp/build/index.js"]
+    }
+  }
+}
+```
+
+---
+
+## Original README
 
 > **Security Notice**: Command injection vulnerabilities present in versions < 1.3.3 have been fixed. Please update to v1.3.3 or later. See [SECURITY.md](SECURITY.md) for details.
 
